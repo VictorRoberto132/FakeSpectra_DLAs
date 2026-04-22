@@ -1,0 +1,23 @@
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+.DS_Store
+images/
+images/
+
+# data products
+*.pkl
+*.csv
+*.hdf5
+*.fits
+
+# mini simulations libraries
+notebooks/mini_sims_library_fiducial_100Mpch/
+notebooks/mini_fiducial_test/
+notebooks/mini_sims_library_fiducial/
+notebooks/mini_sims_library_fiducial_small/
+notebooks/mini_sims_library_TNG50-4/
+
+
+# jupyter checkpoints
+.ipynb_checkpoints/

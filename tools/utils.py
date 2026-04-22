@@ -1,26 +1,21 @@
 import h5py
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.lines as mlines
 import os
-import sys
 import logging
-from matplotlib.colors import LogNorm 
 import fake_spectra.spectra as spectra
 import fake_spectra.abstractsnapshot as absn
 
 # --- LOGGING CONFIGURATION ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ==============================================================================
-# CLASS 0: HALO MATCHER
-# ==============================================================================
 class HaloMatcher:
+    """Matches the catalog index to the global simulation Halo ID."""
     def __init__(self, xmatch_dir):
         self.xmatch_dir = xmatch_dir
         self.match_catalogs = {}
 
     def get_halo_id(self, sim_name, match_index):
+        """Retrieves the real Halo ID given the cross-match index."""
         if sim_name not in self.match_catalogs:
             filename = f"xmatch_{sim_name}.npy"
             path = os.path.join(self.xmatch_dir, filename)
@@ -38,23 +33,25 @@ class HaloMatcher:
         if match_index < 0 or match_index >= len(catalog):
             raise ValueError(f"Match Index {match_index} is out of bounds.")
             
-        real_id = catalog[match_index]
-        return int(real_id)
+        return int(catalog[match_index])
 
-# ==============================================================================
-# CLASS 1: SIMULATION CONTEXT
-# ==============================================================================
+
 class SimulationContext:
-    def __init__(self, base_path, snap_num):
+    """Holds the global state and paths for the full simulation map."""
+    def __init__(self, base_path, snap_num, sim_type="MN5"):
         self.base_path = base_path
-        self.snap_num = snap_num
-        self.group_dir = f"groups_{snap_num}"
-        self.snap_dir = f"snapdir_{snap_num}"
-        self._apply_mn5_patch()
-        self.baryonic_params = self._load_baryonic_params()
+        self.sim_type = sim_type.upper()
+        
+        self.snap_num = f"{snap_num:03d}" if isinstance(snap_num, int) else snap_num
+        self.group_dir = f"groups_{self.snap_num}"
+        self.snap_dir = f"snapdir_{self.snap_num}"
+        
+        # Apply MN5 specific patch to bypass missing HighWord attributes
+        if self.sim_type == "MN5":
+            self._apply_mn5_patch()
 
     def _apply_mn5_patch(self):
-        """Patches fake_spectra to handle MN5 specific HDF5 attributes."""
+        """Monkey patches the absn get_header_attr to handle MN5 missing keywords."""
         TargetClass = absn.AbstractSnapshot
         if not hasattr(TargetClass, '_original_get_header_attr'):
             TargetClass._original_get_header_attr = TargetClass.get_header_attr
@@ -69,241 +66,146 @@ class SimulationContext:
                     return instance._f_handle["Parameters"].attrs[attr]
                 except KeyError:
                     pass
-            if attr == "NumPart_Total_HighWord": return 0
+            if attr == "NumPart_Total_HighWord": 
+                return np.zeros(6, dtype=np.int32)
             raise KeyError(f"Could not find attribute '{attr}'")
 
         TargetClass.get_header_attr = patched_get_header_attr
 
-    def _load_baryonic_params(self):
-        g_file = os.path.join(self.base_path, self.group_dir, f"fof_subhalo_tab_{self.snap_num}.0.hdf5")
-        keys = ["WindEnergyIn1e51erg", "VariableWindVelFactor", "WindFreeTravelDensFac",
-                "MaxSfrTimescale", "RadioFeedbackFactor", "BlackHoleFeedbackFactor", 
-                "RadioFeedbackReiorientationFactor"]
-        params = {}
-        try:
-            with h5py.File(g_file, 'r') as f:
-                if 'Parameters' in f:
-                    attrs = f['Parameters'].attrs
-                    for k in keys: params[k] = attrs.get(k, np.nan)
-        except Exception: pass
-        return params
-
     def get_group_file(self, index):
+        """Constructs the path for a specific FoF group file."""
         return os.path.join(self.base_path, self.group_dir, f"fof_subhalo_tab_{self.snap_num}.{index}.hdf5")
 
-    def get_snap_file(self, index):
-        return os.path.join(self.base_path, self.snap_dir, f"snapshot_{self.snap_num}.{index}.hdf5")
 
-# ==============================================================================
-# CLASS 2: HALO FINDER (UPDATED FOR GROUPS/FOF)
-# ==============================================================================
 class HaloFinder:
+    """Finds specific halos within the full simulation group catalog."""
     def __init__(self, sim_context):
         self.sim = sim_context
 
     def get_halo_properties(self, global_halo_id):
-        """
-        Retrieves properties for a FOF GROUP (Halo), not a Subhalo.
-        """
-        # Read header from the first file to get totals
+        """Scans the FoF files to find the center of mass, mass, and velocity of a target halo."""
         with h5py.File(self.sim.get_group_file(0), 'r') as f:
-            n_group_files = int(f['Header'].attrs['NumFiles'])
+            n_group_files = int(f['Header'].attrs.get('NumFiles', f['Header'].attrs.get('NumFilesPerSnapshot', 1)))
             box_size = f['Header'].attrs['BoxSize']
-            n_total = int(f['Header'].attrs['Ngroups_Total']) 
             scale_factor = f['Header'].attrs['Time'] 
             redshift = f['Header'].attrs['Redshift']
 
-        if global_halo_id >= n_total: 
-            raise ValueError(f"Halo ID {global_halo_id} out of bounds (Total Groups: {n_total}).")
-
-        halo_count = 0
+        current_id_offset = 0
         for i in range(n_group_files):
             g_file = self.sim.get_group_file(i)
-            with h5py.File(g_file, 'r') as f:
-                n_here = int(f['Header'].attrs['Ngroups_ThisFile'])
+            if not os.path.exists(g_file): continue
                 
-                if halo_count + n_here > global_halo_id:
-                    local_index = int(global_halo_id - halo_count)
+            with h5py.File(g_file, 'r') as f:
+                if 'Group' not in f or 'Group_M_Crit200' not in f['Group']: continue
                     
-                    # Assume standard TNG units for velocity: km/s/a.
-                    raw_vel = f['Group']['GroupVel'][local_index]
-                    phys_vel = raw_vel * np.sqrt(scale_factor) 
-                    
-                    r200 = 0.0
-                    if 'Group_R_Crit200' in f['Group']:
-                        r200 = f['Group']['Group_R_Crit200'][local_index]
-                        
+                n_here = len(f['Group']['Group_M_Crit200'])
+                if global_halo_id < current_id_offset + n_here:
+                    local_index = int(global_halo_id - current_id_offset)
                     return {
                         'id': global_halo_id,
                         'cm': f['Group']['GroupPos'][local_index],
                         'mass': f['Group']['Group_M_Crit200'][local_index],
-                        'r200': r200, 
-                        'vel_pec': phys_vel,
+                        'r200': f['Group']['Group_R_Crit200'][local_index], 
+                        'vel_raw': f['Group']['GroupVel'][local_index],
                         'box_size': box_size,
                         'redshift': redshift,
                         'scale_factor': scale_factor
                     }
-                halo_count += n_here
+                current_id_offset += n_here
         raise ValueError(f"Halo {global_halo_id} not found in any group file.")
 
-# ==============================================================================
-# CLASS 3: GAS LOADER
-# ==============================================================================
-class GasLoader:
-    def __init__(self, sim_context):
-        self.sim = sim_context
-
-    @staticmethod
-    def _apply_pbc_shift(coords, center, box):
-        delta = coords - center
-        delta[delta > box/2] -= box
-        delta[delta < -box/2] += box
-        return delta
-
-    def load_gas_slice(self, halo_cm, box_size, slice_thickness=10.0):
-        gas_coords = []
-        with h5py.File(self.sim.get_snap_file(0), 'r') as f:
-            n_files = int(f['Header'].attrs['NumFilesPerSnapshot'])
-
-        for i in range(n_files):
-            try:
-                with h5py.File(self.sim.get_snap_file(i), 'r') as f:
-                    if 'PartType0' in f:
-                        pos = f['PartType0']['Coordinates'][:]
-                        dz = pos[:, 2] - halo_cm[2]
-                        dz[dz > box_size/2] -= box_size
-                        dz[dz < -box_size/2] += box_size
-                        mask = (np.abs(dz) < slice_thickness/2)
-                        if np.sum(mask) > 0:
-                            centered = self._apply_pbc_shift(pos[mask], halo_cm, box_size)
-                            gas_coords.append(centered)
-            except: continue
-        return np.concatenate(gas_coords) if gas_coords else np.zeros((1,3))
-
-# ==============================================================================
-# CLASS 4: SPECTRUM & MULTI-SKEWER ENGINES
-# ==============================================================================
-# ... (imports permanecem iguais)
 
 class SpectrumEngine:
+    """Handles fake_spectra extraction natively in batch mode using RAM optimization."""
     def __init__(self, sim_context, halo_data):
         self.sim = sim_context
         self.halo = halo_data
         self.ss = None
-        self.flux = None
-        self.axis = 1
-        self.tau = None
-        # Stores the scalar Column Density (summed inside isolation radius)
-        self.n_hi_masked = 0.0 
-        self.tau_threshold = 0.1 
-        # [NOVO] Armazena o array de densidade para cálculo de velocidade coerente
-        self.col_den_centered = None 
+        self.tau_batch = None
+        self.col_den_batch = None
         
-    def generate_skewer(self, axis=1):
-        """Generates the full box skewer using fake_spectra."""
-        self.axis = axis 
-        cofm = np.array([self.halo['cm']]); axis_arr = np.array([axis], dtype=np.int32)
-        save_file = f"temp_skewer_{self.halo['id']}_{np.random.randint(100000)}.hdf5"
-        
-        # Reload_file=True forces recalculation (no caching issues)
-        self.ss = spectra.Spectra(self.sim.snap_num, self.sim.base_path, cofm=cofm, axis=axis_arr, 
-                                  res=10, savefile=save_file, reload_file=True)
-        
-        # Get Optical Depth (Tau)
-        self.tau = self.ss.get_tau("H", 1, 1215)[0, :]
-        
-        self.flux = None 
-        if os.path.exists(save_file): os.remove(save_file)
-        return self.tau
+        # Cosmology Constants
+        self.c_light = 299792.458 # km/s
+        self.lam_rest = 1215.67   # Angstroms
 
-    def get_centered_spectrum(self, mode='halo', window_radius_kms=1500.0, isolation_radius_mpc=None):
+    def generate_skewer_batch(self, axis_array, cofm_array):
         """
-        Centers the spectrum and optionally masks absorption outside a given physical radius.
-        Also calculates the N_HI (Column Density) within that mask.
+        Generates multiple skewers simultaneously applying native 1D Region Growing topological masking.
+        This forces fake_spectra to read the full HDF5 simulation into RAM only once per halo.
         """
-        if self.tau is None: raise RuntimeError("Run generate_skewer() first.")
-
-        # --- Get Column Density from fake_spectra (Shape: [1, nbins]) ---
-        # Units: ions / cm^2 per pixel
-        col_den_raw = self.ss.get_col_density("H", 1)[0, :]
-
-        nbins = self.ss.nbins
-        target_center = nbins // 2
+        # Generate a unique temp file to avoid collisions in parallel execution
+        save_file = f"temp_batch_{self.halo['id']}_{np.random.randint(100000)}.hdf5"
         
-        # --- 1. Determine Shift needed to center the Halo ---
-        axis_idx = self.axis - 1 
-        v_pec = self.halo['vel_pec'][axis_idx]
-        v_hub = (self.halo['cm'][axis_idx] / self.halo['box_size']) * self.ss.vmax
-        halo_px = int(np.round(((v_hub + v_pec) % self.ss.vmax) / self.ss.vmax * nbins))
+        # Both MN5 and TNG are Arepo based. Kernel auto-detect (None) is optimal.
+        self.ss = spectra.Spectra(
+            int(self.sim.snap_num), 
+            self.sim.base_path, 
+            cofm=cofm_array, 
+            axis=axis_array, 
+            res=10.0,                      
+            savefile=save_file, 
+            reload_file=True,
+            kernel=None,                  # AUTO-DETECT (Arepo Voronoi/Tophat)
+            MPI=None,                     
+            quiet=False,                   # Suppress output to avoid terminal flooding
+            filter_mode="DLAs",           
+            dla_phys_thresh="auto"        
+        )
         
-        shift_bins = 0
-
-        if mode == 'halo':
-            shift_bins = target_center - halo_px
-            
-        elif mode == 'gas':
-            # Logic to center on the deepest absorption peak
-            temp_shift = target_center - halo_px
-            tau_temp = np.roll(self.tau, temp_shift)
-            px_kms = self.ss.vmax / nbins
-            win_px = int(window_radius_kms / px_kms)
-            start_win = max(0, target_center - win_px)
-            end_win = min(nbins, target_center + win_px)
-            window_slice = tau_temp[start_win:end_win]
-            
-            if np.max(window_slice) > self.tau_threshold:
-                local_peak_idx = np.argmax(window_slice)
-                global_peak_idx = start_win + local_peak_idx
-                left_edge = global_peak_idx
-                while left_edge > 0 and tau_temp[left_edge] > self.tau_threshold:
-                    left_edge -= 1
-                right_edge = global_peak_idx
-                while right_edge < nbins - 1 and tau_temp[right_edge] > self.tau_threshold:
-                    right_edge += 1
-                center_mass_px = (left_edge + right_edge) / 2.0
-                fine_adjustment = target_center - center_mass_px
-                shift_bins = int(np.round(temp_shift + fine_adjustment))
-            else:
-                shift_bins = temp_shift
-
-        # Apply the roll to center the structure (Tau and Column Density)
-        tau_centered = np.roll(self.tau, shift_bins)
+        # Trigger computation and store the batch results in memory
+        self.tau_batch = self.ss.get_tau("H", 1, 1215)
+        self.col_den_batch = self.ss.get_col_density("H", 1)
         
-        # [NOVO] Guardamos no self para usar no radii_skewers
-        self.col_den_centered = np.roll(col_den_raw, shift_bins) 
+        # Clean up the temporary save file immediately
+        if os.path.exists(save_file): 
+            os.remove(save_file)
 
-        # --- 2. Apply Isolation Mask ---
-        if isolation_radius_mpc is not None:
-            box_mpc = self.halo['box_size']
-            vel_radius_kms = (isolation_radius_mpc / box_mpc) * self.ss.vmax
-            px_kms = self.ss.vmax / nbins
-            radius_px = int(vel_radius_kms / px_kms)
-            
-            indices = np.arange(nbins)
-            dist_from_center = np.abs(indices - target_center)
-            
-            # Mask: True inside the region, False outside
-            mask = dist_from_center <= radius_px
-            
-            # Apply mask to Tau (set to 0 => Flux=1)
-            tau_centered[~mask] = 0.0
-            
-            # Apply mask to Column Density (set to 0)
-            self.col_den_centered[~mask] = 0.0
-            
-            # Calculate Total N_HI within the isolation radius
-            self.n_hi_masked = np.sum(self.col_den_centered)
-            
-            # logging.info(f"Isolation applied: R={isolation_radius_mpc:.2f} Mpc/h.")
-        else:
-            # If no mask, sum the whole box
-            self.n_hi_masked = np.sum(self.col_den_centered)
+    def get_centered_spectrum(self, index=0):
+        """Kinematically centers a specific spectrum from the batch to the Halo rest frame."""
+        if self.tau_batch is None: 
+            raise RuntimeError("Run generate_skewer_batch() first before fetching spectra.")
 
-        # --- 3. Compute Flux and Axis ---
-        self.flux = np.exp(-tau_centered)
+        nbins, vmax = self.ss.nbins, self.ss.vmax
+        box_size = self.halo['box_size']
+        a_scale = self.halo['scale_factor']
         
-        c_light = 299792.458; lam_rest = 1215.67
-        v_axis = (np.arange(nbins) - target_center) * (self.ss.vmax / nbins)
-        wave_axis = lam_rest * (1 + v_axis / c_light)
+        # Extract target skewer data from the batch matrices
+        tau_skewer = self.tau_batch[index, :]
+        col_den_raw = self.col_den_batch[index, :]
+        axis_skewer = self.ss.axis[index]
         
-        return wave_axis, self.flux, lam_rest
+        flux_raw = np.exp(-tau_skewer)
+
+        # Retrieve the axis of integration (0 for X, 1 for Y, 2 for Z)
+        axis_idx = axis_skewer - 1 
+        
+        # Compute kinematic components along the line of sight for the target halo
+        v_cosmo = (self.halo['cm'][axis_idx] / box_size) * vmax
+        v_pec = self.halo['vel_raw'][axis_idx] * np.sqrt(a_scale)
+        v_sys = v_cosmo + v_pec
+
+        v_axis = np.arange(nbins) * (vmax / nbins)
+        v_rel = v_axis - v_sys
+        
+        # Periodic wrapping for velocities
+        v_rel_wrapped = (v_rel + vmax / 2.0) % vmax - vmax / 2.0
+        
+        sort_idx = np.argsort(v_rel_wrapped)
+        max_idx = min(len(flux_raw), len(v_rel_wrapped))
+        sort_idx = sort_idx[sort_idx < max_idx]
+
+        # Standardize grid
+        v_common = np.linspace(-vmax / 2.0, vmax / 2.0, nbins)
+        flux_centered = np.interp(v_common, v_rel_wrapped[sort_idx], flux_raw[sort_idx])
+        col_den_centered = np.interp(v_common, v_rel_wrapped[sort_idx], col_den_raw[sort_idx])
+
+        wave_common = self.lam_rest * np.exp(v_common / self.c_light)
+        chi_v_common = v_common / (vmax / box_size)
+
+        return wave_common, v_common, chi_v_common, flux_centered, col_den_centered, self.lam_rest
+
+    def get_total_col_den(self, index=0):
+        """Returns the total Column Density (N_HI) for a specific skewer in the batch."""
+        if self.col_den_batch is None: 
+            return 0.0
+        return np.sum(self.col_den_batch[index, :])
