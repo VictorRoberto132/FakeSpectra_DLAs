@@ -34,8 +34,8 @@ logging.basicConfig(filename=LOG_FILE, filemode='w', level=logging.ERROR,
 
 # --- 1. GENERAL CONFIGURATION ---
 SNAP_NUM = "094"  # Snapshot number to process
-SIM_NAME = "LH_0" # Matches the updated xmatch and folder names
-BASE_PATH = "/home/STORAGE/MN5_resims/LH_0/hydro_output"
+SIM_NAME = "LH_1" # Matches the updated xmatch and folder names
+BASE_PATH = "/home/STORAGE/MN5_resims/LH_1/hydro_output"
 SIM_TYPE = "MN5" # Set to "MN5" or "TNG" to handle kernel assignment
 
 # Set the number of Halos to process. Use an integer (e.g., 1) or "all"
