@@ -1,8 +1,9 @@
+# jupyter checkpoints
 .ipynb_checkpoints/
+
 __pycache__/
 *.pyc
 .DS_Store
-images/
 images/
 
 # data products
@@ -20,9 +21,6 @@ notebooks/mini_sims_library_fiducial_small/
 notebooks/mini_sims_library_TNG50-4/
 
 
-# jupyter checkpoints
-.ipynb_checkpoints/
-
 # Data products: the .pkl files (~1.1 GB each) are not versioned. Clone the
 # repo, download the simulations and run the pipeline to regenerate them.
 # The run_config.json files ARE versioned: they are the exact recipe
@@ -32,4 +30,6 @@ data_*/*
 
 # Legacy data kept next to the notebooks
 notebooks_TNG/data_*/
-notebooks_TNG/voigt_temperature_fits/nohup.out
+notebooks_TNG/voigt_temperature_fits/
+
+nohup.out

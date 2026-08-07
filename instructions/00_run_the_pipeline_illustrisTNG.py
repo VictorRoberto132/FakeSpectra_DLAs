@@ -1,11 +1,8 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 00_run_the_pipeline_illustrisTNG.py
 ===================================
-
 ONE-STOP DRIVER for the Lyman-alpha skewer extraction around IllustrisTNG
-halos. Edit the CONFIG block below, then:
+haloes. Edit the CONFIG block below, then:
 
     python 00_run_the_pipeline_illustrisTNG.py
 
@@ -19,17 +16,71 @@ exactly what was run.
 
 WHAT IT DOES
     1. Sanity-checks the environment: the tools/ modules, the HCD fork of
-       fake_spectra, the simulation directories, the core count.
+       fake_spectra, the simulation directories, the core count, free disk.
     2. Creates <project root>/<OUTPUT_DIRNAME>/ for the results.
-    3. Runs tools/run_parallel_illustris.py once per realization, each with
-       its own seed, writing one .pkl per realization into that folder.
+    3. Runs tools/run_parallel_illustris.py once per realization, each with its
+       own seed, writing one .pkl per realization into that folder.
     4. Writes run_config.json next to the data, and prints a summary.
 
-WHERE THINGS LIVE
+WHAT THE PIPELINE COMPUTES
+    For every sampled halo, sightlines are shot through the box at a range of
+    impact parameters b (in units of R_200) and the Lyman-alpha optical depth is
+    integrated along each one. In HCD mode a 1D region-growing algorithm keeps
+    only the gas cells that belong to the halo's High Column Density structure,
+    so the spectrum is not contaminated by unrelated forest along the line of
+    sight. A sightline whose integrated column fails log N_HI >= 17.2 is zeroed
+    (flux = 1, log_n_hi = 0, is_hcd = False): a selection outcome, not a gap.
 
+WHICH SIMULATION FIELDS ARE READ
+    You do not need a full snapshot download. The TNG web API lets you request
+    individual fields; these are the ones actually touched.
+
+    Group catalogue -- groups_<NNN>/fof_subhalo_tab_<NNN>.*.hdf5
+        Group_M_Crit200   Mass inside the radius enclosing 200x the critical
+                          density. Units 1e10 M_sun/h. Drives the mass-bin
+                          stratification and is stored as `halo_mass`.
+        Group_R_Crit200   That radius, in code length units (ckpc/h for TNG).
+                          Sets the physical scale of every impact parameter:
+                          b = r_multiplier * R_200.
+        GroupPos          Halo centre (potential minimum), ckpc/h. Where the
+                          sightlines are anchored.
+        GroupVel          Halo peculiar velocity, km/s/a in the TNG convention.
+                          Used to shift each spectrum into the halo rest frame,
+                          so v = 0 is the halo and not the box.
+        GroupFirstSub     Index of the central subhalo, used to look up:
+        SubhaloVmax       Peak of the circular-velocity curve, km/s physical.
+                          Stored as `halo_vmax`; the only input beyond mass and
+                          radius that radii_skewers.add_concentration needs to
+                          recover the NFW concentration c_200.
+
+    Snapshot -- snapdir_<NNN>/snap_<NNN>.*.hdf5, PartType0 (gas)
+        Coordinates                 Cell positions, ckpc/h. Selects which cells
+                                    lie near each sightline.
+        Masses                      Cell masses, 1e10 M_sun/h.
+        Density                     Gas density. With Masses it gives the cell
+                                    volume, hence the smoothing length used by
+                                    the kernel weighting when no explicit one is
+                                    stored (Arepo cells are Voronoi, not SPH).
+        Velocities                  Peculiar velocities, km*sqrt(a)/s. Put the
+                                    absorption in redshift space.
+        NeutralHydrogenAbundance    n_HI / n_H, the neutral fraction. TNG already
+                                    applies its own self-shielding and
+                                    star-forming-gas model, so the pipeline reads
+                                    this directly rather than recomputing it.
+        InternalEnergy              With ElectronAbundance, gives the gas
+        ElectronAbundance           temperature, which sets the thermal width of
+                                    the Voigt profile and feeds the per-pixel
+                                    `temp` column.
+        GFM_Metals                  Optional. Column 0 is the hydrogen mass
+                                    fraction; without it the code falls back to
+                                    the primordial value 0.76.
+
+WHERE THINGS LIVE
     FakeSpectra_DLAs/
     ├── instructions/
-    │   └── 00_run_the_pipeline_illustrisTNG.py   <- you are here
+    │   ├── 00_run_the_pipeline_illustrisTNG.py   <- you are here
+    │   ├── 01_check_io_format.ipynb              validates the output format
+    │   └── 02_worked_example.ipynb               loading -> plots, end to end
     ├── tools/
     │   ├── utils.py
     │   ├── radii_skewers.py
@@ -39,17 +90,42 @@ WHERE THINGS LIVE
         ├── TNG50-4_z3_..._run0_seed42.pkl
         └── ...
 
-The output folder is placed in the PROJECT ROOT, not inside instructions/.
+    The output folder is placed in the PROJECT ROOT, not inside instructions/.
 
-READING THE RESULTS
+USING THE OUTPUT
+    One pickled DataFrame per realization, one row per sightline. The shared
+    spectral grids and the snapshot constants travel in df.attrs, which survives
+    to_pickle/read_pickle -- a single file is self-describing.
 
-    import pandas as pd, sys
-    sys.path.append("tools")
-    import radii_skewers as rs
+        import sys, pandas as pd
+        sys.path.append("tools")
+        import radii_skewers as rs
 
-    df = pd.read_pickle("<OUTPUT_DIRNAME>/..._run0_seed42.pkl")
-    rs.add_moments(df)          # eq_width, std_dev, skewness, T_hi, ...
-    rs.add_concentration(df)    # halo_v200, halo_c200
+        df   = pd.read_pickle("<OUTPUT_DIRNAME>/..._run0_seed42.pkl")
+        meta = dict(df.attrs)
+
+        meta["v_grid"]           # (nbins,) velocity axis of EVERY array column
+        meta["pixel_length_cm"]  # n_HI[cm^-3] = df["n_hi_col"] / this
+
+        row = df[df["is_hcd"]].iloc[0]
+        row["flux"]              # transmitted flux, exp(-tau), per pixel
+        row["log_n_hi"]          # log10 of the INTEGRATED column
+        row["temp"]              # N_HI-weighted T per pixel; 0 where no HCD gas
+
+    Anything derivable was left out of the file and is recomputed on demand:
+
+        rs.add_moments(df)        # eq_width, std_dev, skewness, kurtosis, T_hi
+        rs.add_concentration(df)  # halo_v200, halo_c200
+        rs.categorize(df["log_n_hi"])   # Forest / LLS / Sub_DLA / ... / Large_DLA
+
+    Two gotchas. Stacking realizations with pd.concat raises
+    "ValueError: The truth value of an array..." because pandas compares the
+    .attrs of the operands and ours hold numpy arrays -- clear .attrs on the
+    copies you concatenate, and keep meta separately. And the `kurtosis` column
+    collides with the pandas Series.kurtosis() method: use row["kurtosis"],
+    never row.kurtosis.
+
+    instructions/02_worked_example.ipynb runs all of this end to end.
 
 PREREQUISITE
     The HCD fork of fake_spectra must be installed:
@@ -57,7 +133,8 @@ PREREQUISITE
     Fork of sbird/fake_spectra v2.2.4 (MIT). To see exactly what changed:
         git clone https://github.com/VictorRoberto132/fake_spectra
         cd fake_spectra && git diff v2.2.4..v2.2.4-hcd1 -- fake_spectra/spectra.py
-    This script verifies it and refuses to start otherwise.
+    This script verifies it and refuses to start otherwise. Reading the output
+    does NOT require the fork.
 """
 
 import argparse
@@ -164,9 +241,8 @@ def preflight():
         ok(f"runner found: {RUNNER}")
     else:
         fail(f"missing {RUNNER}")
-        problems.append(
-                "install the fork:\n"
-                "      pip install \"git+https://github.com/VictorRoberto132/fake_spectra@v2.2.4-hcd1\"")
+        problems.append("tools/run_parallel_illustris.py not found -- is this a "
+                        "complete checkout of the repository?")
     for mod in ("utils.py", "radii_skewers.py"):
         if (TOOLS_DIR / mod).is_file():
             ok(f"tools/{mod}")
@@ -183,10 +259,9 @@ def preflight():
         else:
             fail("fake_spectra is the STOCK upstream package, not the HCD fork")
             problems.append(
-                "install the fork:\n"
-                "      SP=$(python -c 'import fake_spectra.spectra as s; print(s.__file__)')\n"
-                "      cp \"$SP\" \"$SP.backup\"\n"
-                f"      cp {TOOLS_DIR / 'spectra_corrected.py'} \"$SP\"")
+                "install the HCD fork:\n"
+                "      pip install \"git+https://github.com/VictorRoberto132/"
+                "fake_spectra@v2.2.4-hcd1\"")
     except ImportError as e:
         fail(f"cannot import fake_spectra ({e})")
         problems.append("fake_spectra is not installed in this environment")
