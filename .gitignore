@@ -10,6 +10,7 @@ images/
 *.csv
 *.hdf5
 *.fits
+*.claude
 
 # mini simulations libraries
 notebooks/mini_sims_library_fiducial_100Mpch/
@@ -21,3 +22,14 @@ notebooks/mini_sims_library_TNG50-4/
 
 # jupyter checkpoints
 .ipynb_checkpoints/
+
+# Data products: the .pkl files (~1.1 GB each) are not versioned. Clone the
+# repo, download the simulations and run the pipeline to regenerate them.
+# The run_config.json files ARE versioned: they are the exact recipe
+# (command line, seeds, mass bins, impact grid) behind each realization.
+data_*/*
+!data_*/run_config.json
+
+# Legacy data kept next to the notebooks
+notebooks_TNG/data_*/
+notebooks_TNG/voigt_temperature_fits/nohup.out
