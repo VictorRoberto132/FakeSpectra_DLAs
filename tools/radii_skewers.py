@@ -45,7 +45,7 @@ _utils = None
 
 
 def _get_utils():
-    """Importa tools.utils apenas quando realmente for extrair espectros."""
+    """Import tools.utils only when spectra are actually extracted."""
     global _utils
     if _utils is None:
         try:
@@ -134,6 +134,18 @@ class SkewerGeometry:
             One entry per skewer, with only the non-derivable quantities.
         """
         modes = tuple(LEGACY_FILTER_MODES.get(m, m) for m in tuple(modes))
+        axis_array, cofm_array = self._los_arrays(skewers_list)
+
+        print(f"--> [Halo {self.halo['id']}] extracting {len(skewers_list)} skewers "
+              f"({', '.join(modes)}) in RAM...", flush=True)
+
+        eng = _get_utils().SpectrumEngine(self.ctx, self.halo, **(engine_kwargs or {}))
+        out = eng.run(axis_array, cofm_array, modes=modes, products=products,
+                      zero_below_cut=zero_below_cut)
+        return self._meta_and_rows(out, skewers_list, modes)
+
+    def _los_arrays(self, skewers_list):
+        """fake_spectra axis (1..3) and position of each skewer of this halo."""
         base_cm = np.asarray(self.halo['cm'], dtype=np.float64)
 
         cofm_list, axis_list = [], []
@@ -143,14 +155,10 @@ class SkewerGeometry:
             axis_list.append(sk['axis'] + 1)                        # fake_spectra axes are 1..3
         cofm_array = np.array(cofm_list, dtype=np.float64)
         axis_array = np.array(axis_list, dtype=np.int32)
+        return axis_array, cofm_array
 
-        print(f"--> [Halo {self.halo['id']}] extracting {len(skewers_list)} skewers "
-              f"({', '.join(modes)}) in RAM...", flush=True)
-
-        eng = _get_utils().SpectrumEngine(self.ctx, self.halo, **(engine_kwargs or {}))
-        out = eng.run(axis_array, cofm_array, modes=modes, products=products,
-                      zero_below_cut=zero_below_cut)
-
+    def _meta_and_rows(self, out, skewers_list, modes):
+        """Shared grids (meta) and one row per skewer, from an engine `out` dict."""
         meta = {
             'v_grid': out['v_grid'],
             'wave_grid': out['wave_grid'],
@@ -165,6 +173,12 @@ class SkewerGeometry:
             # n_HI [cm^-3] = n_hi_col [cm^-2] / pixel_length_cm
             'pixel_length_cm': out['pixel_length_cm'],
             'hcd_log_nhi_cut': out['hcd_log_nhi_cut'],
+            # Extraction settings (HCD window, star-forming gas model)
+            'halo_radius_cut': out['halo_radius_cut'],
+            'sf_neutral': out['sf_neutral'],
+            'sf_criterion': out['sf_criterion'],
+            'sf_temp': out['sf_temp'],
+            'h2_model': out['h2_model'],
             'length_unit_kpc': self.ctx.length_unit_kpc,
             'modes': modes,
         }
@@ -197,6 +211,31 @@ class SkewerGeometry:
                     res[f'temp{sfx}'] = blk['temp'][idx]
             rows.append(res)
         return meta, rows
+
+
+def run_analysis_group(geoms, skewers_lists, modes=("HCD_only",),
+                       products=("colden", "tau", "temp"),
+                       zero_below_cut=True, engine_kwargs=None):
+    """run_analysis_batched for several halos, in ONE read of the snapshot.
+
+    geoms: one SkewerGeometry per halo; skewers_lists: the skewers of each.
+    Returns a list of (meta, rows), one per halo, identical to calling
+    run_analysis_batched halo by halo (see utils.run_halo_group).
+    """
+    modes = tuple(LEGACY_FILTER_MODES.get(m, m) for m in tuple(modes))
+    los = [g._los_arrays(sk) for g, sk in zip(geoms, skewers_lists)]
+
+    n_sk = sum(len(sk) for sk in skewers_lists)
+    print(f"--> [Group of {len(geoms)} halos] extracting {n_sk} skewers "
+          f"({', '.join(modes)}) in RAM...", flush=True)
+
+    outs = _get_utils().run_halo_group(
+        geoms[0].ctx, [g.halo for g in geoms],
+        [a for a, _ in los], [c for _, c in los],
+        modes=modes, products=products, zero_below_cut=zero_below_cut,
+        engine_kwargs=engine_kwargs)
+    return [g._meta_and_rows(out, sk, modes)
+            for g, out, sk in zip(geoms, outs, skewers_lists)]
 
 
 # ======================================================================

@@ -155,17 +155,17 @@ from pathlib import Path
 # --- Simulation -------------------------------------------------------------
 # BASE_PATH is the directory that CONTAINS groups_XXX/ and snapdir_XXX/.
 # SIM_NAME is only a label: it goes into the filenames and df.attrs.
-BASE_PATH = "/home/STORAGE/TNG50-3"
-SIM_NAME  = "TNG50-3"
+BASE_PATH = "/home/STORAGE/TNG50-2"
+SIM_NAME  = "TNG50-2"
 SIM_TYPE  = "TNG"          # "TNG" (lengths in ckpc/h) or "MN5" (Mpc)
 SNAP_NUM  = 25             # 25 -> z ~ 3.0 in TNG50
 
-# --- Realizations -----------------------------------------------------------
+# --- Realizations ----------------------------------------------------------
 # How many independent samples of the halo population to draw. Each one gets
 # its own seed and its own .pkl, which is what the variance analysis compares.
-N_RUNS = 5
+N_RUNS = 5                 # seeds 42 / 137 / 2025 / 999 / 31415, as the production runs
 
-# --- Halo sampling ----------------------------------------------------------
+# --- Halo sampling ---------------------------------------------------------
 # Bin EDGES in log10(M_sun), physical. N edges -> N-1 bins.
 MASS_BIN_EDGES_LOG   = [10.0, 10.5, 11.0, 11.5, 12.0, 13.0]
 N_HALOS_PER_BIN      = 150   # halos drawn per bin
@@ -186,13 +186,19 @@ RANGE_PARAM_IMPACTS = [0.01, 50.0]
 MODES = ["HCD_only"]
 
 # --- Runtime ----------------------------------------------------------------
-NUM_CORES        = 20      # worker processes
-SECONDS_PER_HALO = 300.0   # only for the wall-clock estimate at startup
+# W = 16 workers x K = 6 halos per task: ~300 halos/h on TNG50-2, ~3x the
+# old one-halo-per-task mode, with identical results (benchmarks/05).
+NUM_CORES        = 16      # worker processes (W)
+HALOS_PER_TASK   = 6       # halos per Spectra object = per snapshot read (K); 1 = old mode
+SECONDS_PER_HALO = 190.0   # only for the wall-clock estimate: 16 workers / 300 halos/h
 
 # --- Output -----------------------------------------------------------------
 # Folder created inside the PROJECT ROOT (FakeSpectra_DLAs/).
 # None -> auto: "data_<SIM_NAME>_snap<NNN>_<N_RUNS>runs"
-OUTPUT_DIRNAME = None
+# Peak + blend HCD isolation (window 5 R200), star-forming gas neutral, at 1e4 K
+# and without its H2 (Bird+2014; tools/utils.py SF_GAS_MODEL). Keep the label in
+# the folder name; run_config.json and df.attrs also record these settings.
+OUTPUT_DIRNAME = "data_TNG50-2_snap025_5runs_peak_plus_blend_sfneutral"
 
 # Refuse to start if the folder already holds .pkl files (protects finished
 # runs). Set to False to add/overwrite realizations in an existing folder.
@@ -227,7 +233,7 @@ RUNNER    = TOOLS_DIR / "run_parallel_illustris.py"
 
 
 def resolve_output_dir():
-    name = OUTPUT_DIRNAME or f"data_{SIM_NAME}_snap{SNAP_NUM:03d}_{N_RUNS}runs"
+    name = OUTPUT_DIRNAME or f"data_{SIM_NAME}_snap{SNAP_NUM:03d}_{N_RUNS}runs_peak_plus_blend_10"
     return PROJ_ROOT / name
 
 
@@ -345,9 +351,19 @@ def build_command(run_id, outdir):
         "--impact_min",          str(RANGE_PARAM_IMPACTS[0]),
         "--impact_max",          str(RANGE_PARAM_IMPACTS[1]),
         "--cores",               str(NUM_CORES),
+        "--halos_per_task",      str(HALOS_PER_TASK),
         "--seconds_per_halo",    str(SECONDS_PER_HALO),
         "--outdir",              str(outdir),
     ]
+
+
+def extraction_settings():
+    """HCD window and star-forming gas model, fixed in tools/utils.py (not CONFIG
+    knobs): recorded so that the folder name is not the only label of the method."""
+    sys.path.insert(0, str(TOOLS_DIR))
+    import utils
+    return {"halo_radius_cut_r200": utils.HALO_RADIUS_CUT,
+            "sf_neutral": utils.SF_NEUTRAL, **utils.SF_GAS_MODEL}
 
 
 def write_run_config(outdir, run_ids, commands):
@@ -372,7 +388,8 @@ def write_run_config(outdir, run_ids, commands):
             "skewers_per_halo": 3 + 12 * NUM_PARAM_IMPACTS,
         },
         "modes": list(MODES),
-        "runtime": {"num_cores": NUM_CORES},
+        "runtime": {"num_cores": NUM_CORES, "halos_per_task": HALOS_PER_TASK},
+        "extraction": extraction_settings(),
         "runs": run_ids,
         "commands": [" ".join(c) for c in commands],
     }
@@ -411,6 +428,7 @@ def main():
           f"({3 + 12 * NUM_PARAM_IMPACTS} skewers/halo)")
     print(f"  {UI.BOLD}Modes        :{UI.RESET} {', '.join(MODES)}")
     print(f"  {UI.BOLD}Cores        :{UI.RESET} {NUM_CORES}")
+    print(f"  {UI.BOLD}Halos / task :{UI.RESET} {HALOS_PER_TASK}")
 
     preflight()
 

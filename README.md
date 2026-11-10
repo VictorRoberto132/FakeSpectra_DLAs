@@ -93,7 +93,9 @@ FakeSpectra_DLAs/
 ├── tools/
 │   ├── utils.py                 halo/snapshot bookkeeping + extraction engine
 │   ├── radii_skewers.py         skewer geometry + post-processing helpers
-│   └── run_parallel_illustris.py  the worker the driver calls, one run per seed
+│   ├── run_parallel_illustris.py  the worker the driver calls, one run per seed
+│   ├── run_parallel_grid_TNG.py   full-box grid of skewers (legacy)
+│   └── run_parallel.py            worker for the MN5 resimulations (legacy)
 ├── notebooks_TNG/               analysis notebooks (IllustrisTNG)
 ├── notebooks/                   analysis notebooks (MN5 resimulations)
 ├── xmatchs/                     halo cross-match catalogues
@@ -388,12 +390,27 @@ With `filter_mode="None"` the fork reproduces upstream exactly.
 
 ## Notebooks
 
-`notebooks_TNG/` — IllustrisTNG analysis. Covering fractions versus impact
-parameter, ridgeline distributions of N_HI and temperature, resolution
-comparisons between TNG50-2/3/4, halo-mass splits, individual sightline
-inspection and column-density maps.
+`notebooks_TNG/` — IllustrisTNG analysis (TNG50-2 by default). Notebooks that
+apply to one simulation have a `SIM_NAME` switch at the top (`TNG50-2`, `-3`,
+`-4`); with TNG50-2 the paper figures go to `definitives/`, the other
+simulations write to `plots/`.
 
-`notebooks/` — the same machinery applied to the MN5 resimulations.
+| Notebook | What it does |
+|---|---|
+| `01.5_TNG50_individual` | one halo: impact-parameter map + spectra |
+| `01.5.1_TNG50_individual` | one sightline: HCD / forest decomposition, sub-DLA example |
+| `01.5.2_cases_b_d_e` | the same figure for the cases (b), (d), (e) of `14_Temperatures` |
+| `01.6_TNG50_individual_sensitivity` | sensitivity to `halo_radius_cut` and the peak contrast |
+| `07_Mass_function` | halo mass function of TNG50-2/3/4 and the mass-bin choice |
+| `10_variance` | covering fractions and N_HI ridgelines over the 5 realizations |
+| `12_comparisson_TNGs_variance` | resolution comparison TNG50-2/3/4 (appendix) |
+| `13_comparison_MASKs` | HCD mask-window comparison |
+| `14_Temperatures` | temperatures and Voigt fits of the HCDs |
+| `15_Deblending_comparisson` | region growing vs peaks + blend |
+| `16_bootstrap` | halo-level bootstrap errors on one run |
+| `17_HI_vs_SiIII_single_skewer` | HI vs Si III along one sightline |
+
+`notebooks/` — the MN5 resimulations (`00_How_to_run_MN5`, `03_MN5_individual`).
 
 `instructions/01_check_io_format.ipynb` — the entry point: what is in the files
 and how to read them.

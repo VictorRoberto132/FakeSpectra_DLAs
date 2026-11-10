@@ -79,40 +79,40 @@ def estimate_time(n_halos, n_cores):
 
 def align_to_absorption_center(vel_array, flux_array):
     """
-    Encontra o centro real da absorção. Protegido contra múltiplos sistemas saturados
-    na mesma linha de visada, escolhendo a bacia mais próxima do centro cinemático.
+    Find the real centre of the absorption. Safe against several saturated systems
+    on the same sightline: picks the basin closest to the kinematic centre.
     """
     min_flux = np.min(flux_array)
     threshold = min_flux + 0.02 
     
-    # Encontra todos os índices no fundo do poço
+    # All the indices at the bottom of the trough
     bottom_indices = np.where(flux_array <= threshold)[0]
     
     if len(bottom_indices) == 0:
         return vel_array, 0.0
         
-    # Identifica se existem quebras/buracos entre os índices (múltiplas absorções separadas)
+    # Gaps between the indices mean several separate absorptions
     jumps = np.where(np.diff(bottom_indices) > 1)[0]
     
     if len(jumps) == 0:
-        # Cenário seguro: Apenas uma bacia contínua encontrada
+        # Simple case: a single continuous basin
         v_center = np.mean(vel_array[bottom_indices])
     else:
-        # Cenário complexo: Duas ou mais bacias saturadas empatadas!
-        # Separa os índices em blocos (starts e ends)
+        # Harder case: two or more saturated basins at the same depth
+        # Split the indices into blocks (starts and ends)
         starts = np.insert(bottom_indices[jumps + 1], 0, bottom_indices[0])
         ends = np.append(bottom_indices[jumps], bottom_indices[-1])
         
         best_center = 0.0
         min_dist_to_kinematic_zero = np.inf
         
-        # Calcula o centro de cada bacia isoladamente
+        # Centre of each basin on its own
         for s, e in zip(starts, ends):
             island_indices = np.arange(s, e + 1)
             island_v_center = np.mean(vel_array[island_indices])
             
-            # Elege como "v_center" a bacia que estiver fisicamente mais associada
-            # ao halo central original (mais próxima do v=0 original)
+            # v_center = the basin most associated with the central halo,
+            # i.e. the closest to the original v = 0
             if np.abs(island_v_center) < min_dist_to_kinematic_zero:
                 min_dist_to_kinematic_zero = np.abs(island_v_center)
                 best_center = island_v_center
@@ -152,8 +152,8 @@ def process_single_halo(match_index):
         batch_results = geom.run_analysis_batched(all_skewers)
 
         for res in batch_results:
-            # O ALINHAMENTO DEVE ACONTECER AQUI DENTRO DO LOOP
-            # E precisamos receber as duas variáveis de volta
+            # The alignment must happen here, inside the loop,
+            # and it returns both the aligned axis and the shift
             vel_aligned_arr, v_center_val = align_to_absorption_center(res['vel_axis'], res['flux'])
 
             summary_dict = {
@@ -180,7 +180,7 @@ def process_single_halo(match_index):
                 'mean_vel': res.get('mean_vel', np.nan),
                 'vel_coherent': res.get('vel_coherent', np.nan),
                 
-                # Valor numérico do quanto o espectro foi movido
+                # How much the spectrum was shifted
                 'vel_peak_shift': v_center_val, 
                 
                 # Store fully centered native grids

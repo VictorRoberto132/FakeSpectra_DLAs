@@ -38,6 +38,9 @@ you just want to point the pipeline at your own simulation.
     --n_impacts N          number of log-spaced impact parameters (b=0 extra)
     --impact_min X --impact_max X   impact range in units of R200
     --cores N              worker processes
+    --halos_per_task N     halos extracted together in one Spectra object, i.e.
+                           one snapshot read per group (default 1 = one halo
+                           per task; same results, fewer reads when > 1)
     --outdir DIR           where the .pkl goes (default: <proj_root>/notebooks)
 
 UNIT CONVENTION:
@@ -189,6 +192,11 @@ NUM_PARAM_IMPACTS   = 30
 RANGE_PARAM_IMPACTS = [0.01, 50.0]
 
 NUM_CORES = 17
+
+# Halos extracted together in ONE Spectra object (one snapshot read for the
+# group, see utils.run_halo_group). 1 = one halo per task, the original mode.
+# Same results either way; larger groups read the snapshot fewer times.
+HALOS_PER_TASK = 1
 
 # Wall-clock estimate. The extraction is batched: one snapshot read per halo,
 # so the cost scales with halos, not with skewers. Calibrate this once by
@@ -391,56 +399,121 @@ def process_single_halo(args):
             all_skewers.extend(geom.generate_skewers(r_multiplier=r_mult))
 
         meta, rows = geom.run_analysis_batched(all_skewers, modes=modes)
-        v_grid = meta['v_grid']
-        single = (len(modes) == 1)
-
-        for res in rows:
-            rec = {
-                # --- Halo identification ---
-                'halo_id'      : halo_id,
-                'halo_mass'    : res['halo_mass'],
-                'halo_r200'    : res['halo_r200'],       # code length units
-                'halo_vmax'    : res['halo_vmax'],       # km/s (physical), central
-                                                         # subhalo; NaN if none.
-                                                         # c200 on demand:
-                                                         # radii_skewers.add_concentration
-                'redshift'     : meta['redshift'],       # kept as a column so that
-                                                         # concatenating snapshots is safe
-                # --- Skewer geometry ---
-                'skewer_id'    : res['skewer_id'],
-                'axis'         : res['axis'],
-                'position_tag' : res['position_tag'],
-                'r_multiplier' : res['r_multiplier'],
-                'impact_kpc'   : (res['r_multiplier'] * res['halo_r200']
-                                  * meta['length_unit_kpc']),
-            }
-
-            for mode in modes:
-                sfx = "" if single else f"_{mode}"
-                flux = res[f'flux{sfx}']
-
-                # --- Column density ---
-                rec[f'log_n_hi{sfx}'] = res[f'log_n_hi{sfx}']
-                rec[f'is_hcd{sfx}']   = res[f'is_hcd{sfx}']
-
-                # --- Kinematics: trough closest to the halo rest frame.
-                #     The aligned axis is v_grid - vel_peak_shift, so we only
-                #     keep the scalar. ---
-                rec[f'vel_peak_shift{sfx}'] = radii_skewers.peak_shift(flux, v_grid)
-
-                # --- Native spectral grids (float32 for size) ---
-                rec[f'flux{sfx}']     = np.asarray(flux, dtype=np.float32)
-                rec[f'n_hi_col{sfx}'] = np.asarray(res[f'n_hi_col{sfx}'], dtype=np.float32)
-                if f'temp{sfx}' in res:
-                    rec[f'temp{sfx}'] = np.asarray(res[f'temp{sfx}'], dtype=np.float32)
-
-            results_buffer.append(rec)
+        results_buffer = _halo_records(halo_id, meta, rows, modes)
 
     except Exception as e:
         logging.error(f"Halo ID {halo_id}: {str(e)}", exc_info=True)
         return (halo_id, [], None, "ERROR")
 
     return (halo_id, results_buffer, meta, "SUCCESS")
+
+
+def _halo_records(halo_id, meta, rows, modes):
+    """Output records (one per skewer) of one halo, from run_analysis_batched rows."""
+    v_grid = meta['v_grid']
+    single = (len(modes) == 1)
+    results_buffer = []
+    for res in rows:
+        rec = {
+            # --- Halo identification ---
+            'halo_id'      : halo_id,
+            'halo_mass'    : res['halo_mass'],
+            'halo_r200'    : res['halo_r200'],       # code length units
+            'halo_vmax'    : res['halo_vmax'],       # km/s (physical), central
+                                                     # subhalo; NaN if none.
+                                                     # c200 on demand:
+                                                     # radii_skewers.add_concentration
+            'redshift'     : meta['redshift'],       # kept as a column so that
+                                                     # concatenating snapshots is safe
+            # --- Skewer geometry ---
+            'skewer_id'    : res['skewer_id'],
+            'axis'         : res['axis'],
+            'position_tag' : res['position_tag'],
+            'r_multiplier' : res['r_multiplier'],
+            'impact_kpc'   : (res['r_multiplier'] * res['halo_r200']
+                              * meta['length_unit_kpc']),
+        }
+
+        for mode in modes:
+            sfx = "" if single else f"_{mode}"
+            flux = res[f'flux{sfx}']
+
+            # --- Column density ---
+            rec[f'log_n_hi{sfx}'] = res[f'log_n_hi{sfx}']
+            rec[f'is_hcd{sfx}']   = res[f'is_hcd{sfx}']
+
+            # --- Kinematics: trough closest to the halo rest frame.
+            #     The aligned axis is v_grid - vel_peak_shift, so we only
+            #     keep the scalar. ---
+            rec[f'vel_peak_shift{sfx}'] = radii_skewers.peak_shift(flux, v_grid)
+
+            # --- Native spectral grids (float32 for size) ---
+            rec[f'flux{sfx}']     = np.asarray(flux, dtype=np.float32)
+            rec[f'n_hi_col{sfx}'] = np.asarray(res[f'n_hi_col{sfx}'], dtype=np.float32)
+            if f'temp{sfx}' in res:
+                rec[f'temp{sfx}'] = np.asarray(res[f'temp{sfx}'], dtype=np.float32)
+
+        results_buffer.append(rec)
+    return results_buffer
+
+
+def process_halo_group(args):
+    """Worker: extracts the skewers of SEVERAL halos in one Spectra per mode.
+
+    Receives (halo_ids, global_seed, cfg). Gives the same records as calling
+    process_single_halo on each halo, but reads the snapshot once for the
+    whole group. A halo whose catalogue entry cannot be used fails alone;
+    an error during the extraction fails the whole group.
+
+    Returns a list of (halo_id, rows, meta, status_string), one per halo.
+    """
+    halo_ids, global_seed, cfg = args
+
+    # Same seeding as process_single_halo, from the first halo of the group
+    # (the skewer geometry itself is deterministic).
+    worker_seed = int((global_seed * 1000003 + halo_ids[0]) % (2**32))
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+    modes         = cfg['modes']
+    r_multipliers = cfg['r_multipliers']
+    results = []
+
+    # Halo properties and skewers, halo by halo
+    geoms, skewers_lists, ok_ids = [], [], []
+    try:
+        ctx         = utils.SimulationContext(cfg['base_path'], cfg['snap_num'],
+                                              sim_type=cfg['sim_type'])
+        halo_finder = utils.HaloFinder(ctx)
+    except Exception as e:
+        logging.error(f"Halo group {list(halo_ids)}: {str(e)}", exc_info=True)
+        return [(hid, [], None, "ERROR") for hid in halo_ids]
+    for halo_id in halo_ids:
+        try:
+            halo_info = halo_finder.get_halo_properties(halo_id)
+            geom = radii_skewers.SkewerGeometry(ctx, halo_info)
+            skewers = []
+            for r_mult in r_multipliers:
+                skewers.extend(geom.generate_skewers(r_multiplier=r_mult))
+            geoms.append(geom)
+            skewers_lists.append(skewers)
+            ok_ids.append(halo_id)
+        except Exception as e:
+            logging.error(f"Halo ID {halo_id}: {str(e)}", exc_info=True)
+            results.append((halo_id, [], None, "ERROR"))
+    if not geoms:
+        return results
+
+    # One extraction for every usable halo of the group
+    try:
+        per_halo = radii_skewers.run_analysis_group(geoms, skewers_lists, modes=modes)
+        for halo_id, (meta, rows) in zip(ok_ids, per_halo):
+            results.append((halo_id, _halo_records(halo_id, meta, rows, modes),
+                            meta, "SUCCESS"))
+    except Exception as e:
+        logging.error(f"Halo group {ok_ids}: {str(e)}", exc_info=True)
+        results.extend((hid, [], None, "ERROR") for hid in ok_ids)
+    return results
 
 # ==============================================================================
 # 5. MAIN BLOCK
@@ -518,6 +591,11 @@ if __name__ == "__main__":
         help=f"Worker processes. Default: {NUM_CORES}.",
     )
     parser.add_argument(
+        "--halos_per_task", type=int, default=None,
+        help="Halos extracted together in one Spectra object (one snapshot read "
+             f"per group). 1 = one halo per task. Default: {HALOS_PER_TASK}.",
+    )
+    parser.add_argument(
         "--seconds_per_halo", type=float, default=None,
         help="Only used for the wall-clock estimate printed at startup. "
              f"Default: {SECONDS_PER_HALO}.",
@@ -562,6 +640,10 @@ if __name__ == "__main__":
         NUM_CORES = args.cores
     if args.seconds_per_halo is not None:
         SECONDS_PER_HALO = args.seconds_per_halo
+    if args.halos_per_task is not None:
+        HALOS_PER_TASK = args.halos_per_task
+    if HALOS_PER_TASK < 1:
+        parser.error("--halos_per_task must be >= 1")
 
     # Rebuild anything derived from the (possibly overridden) knobs.
     R_MULTIPLIERS = build_r_multipliers(NUM_PARAM_IMPACTS, *RANGE_PARAM_IMPACTS)
@@ -596,6 +678,9 @@ if __name__ == "__main__":
         'r_multipliers': R_MULTIPLIERS,
     }
     worker_args = [(hid, GLOBAL_SEED, WORKER_CFG) for hid in ALL_MATCH_INDICES]
+    # Grouped mode: consecutive halos of the list, HALOS_PER_TASK per task
+    group_args = [(list(ALL_MATCH_INDICES[i:i + HALOS_PER_TASK]), GLOBAL_SEED, WORKER_CFG)
+                  for i in range(0, n_halos, HALOS_PER_TASK)]
 
     # --------------------------------------------------------------------------
     # Output location
@@ -644,6 +729,8 @@ if __name__ == "__main__":
           f"(b=0 + {NUM_PARAM_IMPACTS} log-spaced from "
           f"{RANGE_PARAM_IMPACTS[0]} to {RANGE_PARAM_IMPACTS[1]} R200)")
     print(f"{TerminalUI.BOLD}--> Parallel Cores   :{TerminalUI.RESET} {NUM_CORES}")
+    print(f"{TerminalUI.BOLD}--> Halos per task   :{TerminalUI.RESET} {HALOS_PER_TASK}"
+          f"  ({len(group_args) if HALOS_PER_TASK > 1 else n_halos} tasks)")
     print(f"{TerminalUI.BOLD}--> Output dir       :{TerminalUI.RESET} {OUTPUT_DIR}")
     print(f"{TerminalUI.WARNING}{TerminalUI.BOLD}"
           f"--> Estimated Time   : ~{est_mins:.1f} min"
@@ -666,7 +753,13 @@ if __name__ == "__main__":
     )
 
     with multiprocessing.Pool(processes=NUM_CORES) as pool:
-        iterator = pool.imap_unordered(process_single_halo, worker_args)
+        if HALOS_PER_TASK == 1:
+            iterator = pool.imap_unordered(process_single_halo, worker_args)
+        else:
+            # Each task returns a list (one entry per halo): flatten it, so the
+            # loop below sees the same (halo_id, rows, meta, status) tuples
+            iterator = (res for group in pool.imap_unordered(process_halo_group, group_args)
+                        for res in group)
 
         with tqdm(total=n_halos, bar_format=bar_fmt) as pbar:
             for halo_id, result_list, meta, status in iterator:

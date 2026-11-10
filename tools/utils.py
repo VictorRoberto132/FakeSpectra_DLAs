@@ -47,6 +47,30 @@ LYA_REST_ANG = 1215.67
 #: the region growing misses nothing; the selection here keeps only real HCDs.
 HCD_LOG_NHI = spectra.HCD_SELECTION_LOGNHI if hasattr(spectra, "HCD_SELECTION_LOGNHI") else 17.2
 
+#: Half-width of the HCD association window along the sightline, in R200.
+#: 5 is the value of the canonical runs (*_peak_plus_blend); the *_10 / *_50
+#: folders are sensitivity tests with 10 and 50.
+HALO_RADIUS_CUT = 5.0
+
+#: Star-forming gas, as in Bird et al. 2014 (Sec. 2.2): self-shielded / neutral
+#: (sf_neutral), at 1e4 K instead of the 'effective' temperature of the equation
+#: of state, and partly molecular (Blitz & Rosolowsky 2006; H2 does not absorb in
+#: Lyman alpha). Star-forming = StarFormationRate > 0, the flag of the simulation.
+#: See fake_spectra/gas_properties.py of the fork. Every Spectra object of the
+#: project (pipeline and notebooks) is built with these, via SPECTRA_GAS_KWARGS.
+SF_NEUTRAL = True
+SF_GAS_MODEL = {"sf_criterion": "sfr", "sf_temp": 1e4, "h2_model": "BR06"}
+SPECTRA_GAS_KWARGS = {"sf_neutral": SF_NEUTRAL, "gasprop_args": dict(SF_GAS_MODEL)}
+
+# An older fork does not know these options and would crash deep inside a
+# worker on the unknown keyword: fail here instead, with the reason.
+import fake_spectra.gas_properties as _gas_properties
+_missing = set(SF_GAS_MODEL) - set(inspect.signature(_gas_properties.GasProperties.__init__).parameters)
+if _missing:
+    raise ImportError("The installed fake_spectra fork has no %s option(s) in GasProperties "
+                      "(star-forming gas model of 2026-10-25). Update the fork (installed copy: %r)."
+                      % (sorted(_missing), _gas_properties.__file__))
+
 #: Legacy filter-mode spellings, silently mapped to the current names.
 #: Falls back to a hardcoded map if the installed fork predates the rename.
 LEGACY_FILTER_MODES = getattr(spectra, "LEGACY_FILTER_MODES",
@@ -254,11 +278,16 @@ class SpectrumEngine:
         self.tau_batch = None
         self.col_den_batch = None
         self.temp_batch = None
+        self.los_axis = None     # LOS axis (1..3) of each row of the batches
         self.c_light = C_LIGHT_KMS
         self.lam_rest = LYA_REST_ANG
 
     # ------------------------------------------------------------------
-    def _build_spectra(self, axis_array, cofm_array, filter_mode):
+    def _build_spectra(self, axis_array, cofm_array, filter_mode, halo_r200=None):
+        # halo_r200=None -> the R200 of this engine's halo (one halo per
+        # Spectra). run_halo_group passes one R200 per sightline instead.
+        if halo_r200 is None:
+            halo_r200 = float(self.halo['r200'])
         kwargs = dict(
             res=self.res,
             savefile=f"unused_batch_{self.halo['id']}.hdf5",  # never written
@@ -269,8 +298,10 @@ class SpectrumEngine:
             filter_mode=filter_mode,
             hcd_phys_thresh="auto",
             units=self.sim.units,
-            halo_r200=float(self.halo['r200']),
-            halo_radius_cut=5.0,
+            halo_r200=halo_r200,
+            halo_radius_cut=HALO_RADIUS_CUT,
+            sf_neutral=SF_NEUTRAL,
+            gasprop_args=dict(SF_GAS_MODEL),
         )
         kwargs.update(self.spectra_kwargs)
         return spectra.Spectra(int(self.sim.snap_num), self.sim.base_path,
@@ -288,6 +319,7 @@ class SpectrumEngine:
         self.tau_batch = self.ss.get_tau("H", 1, 1215)
         self.col_den_batch = self.ss.get_col_density("H", 1)
         self.temp_batch = self.ss.get_temp("H", 1) if with_temp else None
+        self.los_axis = self.ss.axis
         return self.ss
 
     # ------------------------------------------------------------------
@@ -345,7 +377,7 @@ class SpectrumEngine:
         else:
             flux_raw = np.exp(-tau_skewer)
 
-        v_sys = self._systemic_velocity(int(self.ss.axis[index]))
+        v_sys = self._systemic_velocity(int(self.los_axis[index]))
         flux_c = self._center(flux_raw, v_axis, v_grid, v_sys, vmax)
         colden_c = self._center(col_den_raw, v_axis, v_grid, v_sys, vmax)
         temp_c = (None if temp_raw is None
@@ -376,8 +408,9 @@ class SpectrumEngine:
             out["v_grid"], out["wave_grid"], ...
             out[mode]["flux" | "n_hi_col" | "temp" | "log_n_hi" | "is_hcd"]
 
-        Each mode is a separate Spectra object, i.e. its own snapshot reads
-        (2 per mode, 3 with "temp" in products).
+        Each mode is a separate Spectra object, i.e. its own read of the
+        snapshot (the fork caches the particles, so tau, colden and temp
+        share that one read).
         """
         modes = tuple(LEGACY_FILTER_MODES.get(m, m) for m in tuple(modes))
         with_temp = "temp" in tuple(products)
@@ -386,46 +419,109 @@ class SpectrumEngine:
             ss = self.generate_skewer_batch(axis_array, cofm_array,
                                             filter_mode=mode, with_temp=with_temp)
             if out is None:
-                nbins, vmax = ss.nbins, ss.vmax
-                v_grid = np.linspace(-vmax / 2.0, vmax / 2.0, nbins)
-                out = {
-                    "v_grid": v_grid,
-                    "wave_grid": self.lam_rest * np.exp(v_grid / self.c_light),
-                    "chi_grid": v_grid / ss.velfac,
-                    "nbins": int(nbins),
-                    "vmax": float(vmax),
-                    "dvbin": float(ss.dvbin),
-                    "velfac": float(ss.velfac),
-                    "box_size": float(ss.box),
-                    "redshift": float(ss.red),
-                    "lam_rest": self.lam_rest,
-                    # n_HI [cm^-3] = n_hi_col [cm^-2] / pixel_length_cm
-                    "pixel_length_cm": float(ss.dvbin / ss.velfac * ss.rscale),
-                    "hcd_log_nhi_cut": float(hcd_log_nhi),
-                    "modes": modes,
-                }
-            n_los = len(axis_array)
-            nbins = ss.nbins
-            block = {
-                "flux": np.empty((n_los, nbins)),
-                "n_hi_col": np.empty((n_los, nbins)),
-                "log_n_hi": np.zeros(n_los),
-                "is_hcd": np.zeros(n_los, dtype=bool),
-            }
-            if with_temp:
-                block["temp"] = np.empty((n_los, nbins))
-            for i in range(n_los):
-                # For the total field ("None") the 17.2 cut does not apply.
-                zbc = zero_below_cut and (mode != "None")
-                w, v, chi, flux_c, colden_c, temp_c, lam, is_hcd = \
-                    self.get_centered_spectrum(index=i, zero_below_cut=zbc)
-                tot = self.get_total_col_den(index=i)
-                block["flux"][i] = flux_c
-                block["n_hi_col"][i] = colden_c
-                block["is_hcd"][i] = is_hcd
-                if tot > 0 and (is_hcd or not zbc):
-                    block["log_n_hi"][i] = np.log10(tot)
-                if with_temp:
-                    block["temp"][i] = temp_c
-            out[mode] = block
+                out = self._grids(ss, modes, hcd_log_nhi)
+            out[mode] = self._mode_block(mode, len(axis_array), ss.nbins,
+                                         with_temp, zero_below_cut)
         return out
+
+    def _grids(self, ss, modes, hcd_log_nhi):
+        """Grids and constants shared by every skewer of the snapshot."""
+        nbins, vmax = ss.nbins, ss.vmax
+        v_grid = np.linspace(-vmax / 2.0, vmax / 2.0, nbins)
+        return {
+            "v_grid": v_grid,
+            "wave_grid": self.lam_rest * np.exp(v_grid / self.c_light),
+            "chi_grid": v_grid / ss.velfac,
+            "nbins": int(nbins),
+            "vmax": float(vmax),
+            "dvbin": float(ss.dvbin),
+            "velfac": float(ss.velfac),
+            "box_size": float(ss.box),
+            "redshift": float(ss.red),
+            "lam_rest": self.lam_rest,
+            # n_HI [cm^-3] = n_hi_col [cm^-2] / pixel_length_cm
+            "pixel_length_cm": float(ss.dvbin / ss.velfac * ss.rscale),
+            "hcd_log_nhi_cut": float(hcd_log_nhi),
+            "modes": modes,
+            # Settings of the extraction itself, read back from the Spectra object
+            # so they record what was really used (the folder name is not enough)
+            "halo_radius_cut": float(ss.halo_radius_cut),
+            "sf_neutral": bool(ss.gasprop.sf_neutral),
+            "sf_criterion": ss.gasprop.sf_criterion,
+            "sf_temp": ss.gasprop.sf_temp,
+            "h2_model": ss.gasprop.h2_model,
+        }
+
+    def _mode_block(self, mode, n_los, nbins, with_temp, zero_below_cut):
+        """Centred flux / n_hi_col / temp and log_n_hi, is_hcd of the current batches."""
+        block = {
+            "flux": np.empty((n_los, nbins)),
+            "n_hi_col": np.empty((n_los, nbins)),
+            "log_n_hi": np.zeros(n_los),
+            "is_hcd": np.zeros(n_los, dtype=bool),
+        }
+        if with_temp:
+            block["temp"] = np.empty((n_los, nbins))
+        for i in range(n_los):
+            # For the total field ("None") the 17.2 cut does not apply.
+            zbc = zero_below_cut and (mode != "None")
+            w, v, chi, flux_c, colden_c, temp_c, lam, is_hcd = \
+                self.get_centered_spectrum(index=i, zero_below_cut=zbc)
+            tot = self.get_total_col_den(index=i)
+            block["flux"][i] = flux_c
+            block["n_hi_col"][i] = colden_c
+            block["is_hcd"][i] = is_hcd
+            if tot > 0 and (is_hcd or not zbc):
+                block["log_n_hi"][i] = np.log10(tot)
+            if with_temp:
+                block["temp"][i] = temp_c
+        return block
+
+
+def run_halo_group(sim_context, halos, axis_arrays, cofm_arrays, modes=("HCD_only",),
+                   products=("colden", "tau", "temp"), zero_below_cut=True,
+                   hcd_log_nhi=HCD_LOG_NHI, engine_kwargs=None):
+    """SpectrumEngine.run for SEVERAL halos, with ONE Spectra object per mode.
+
+    The sightlines of all halos go into the same Spectra, with one R200 per
+    sightline (fork option), so the snapshot is read once for the whole group
+    instead of once per halo. Each sightline keeps the HCD window of its own
+    halo, and the centring is done afterwards halo by halo, so the result is
+    the same as running the halos one at a time.
+
+    halos, axis_arrays, cofm_arrays: one entry per halo (same as SpectrumEngine.run).
+    Returns a list with one `out` dict per halo, as SpectrumEngine.run returns.
+    """
+    modes = tuple(LEGACY_FILTER_MODES.get(m, m) for m in tuple(modes))
+    with_temp = "temp" in tuple(products)
+    engines = [SpectrumEngine(sim_context, h, **(engine_kwargs or {})) for h in halos]
+
+    # All sightlines in one array; cuts[k]:cuts[k+1] are the rows of halo k
+    axis_all = np.concatenate(axis_arrays).astype(np.int32)
+    cofm_all = np.concatenate(cofm_arrays).astype(np.float64)
+    r200_all = np.concatenate([np.full(len(a), float(h['r200']))
+                               for h, a in zip(halos, axis_arrays)])
+    cuts = np.cumsum([0] + [len(a) for a in axis_arrays])
+
+    outs = [None] * len(halos)
+    for mode in modes:
+        # One snapshot read for the whole group (built by the first engine:
+        # only the kwargs are taken from it, the R200 comes per sightline)
+        ss = engines[0]._build_spectra(axis_all, cofm_all, mode, halo_r200=r200_all)
+        tau = ss.get_tau("H", 1, 1215)
+        colden = ss.get_col_density("H", 1)
+        temp = ss.get_temp("H", 1) if with_temp else None
+
+        # Give each halo's engine its own rows, then centre as in run()
+        for k, eng in enumerate(engines):
+            sl = slice(cuts[k], cuts[k + 1])
+            eng.ss = ss
+            eng.tau_batch = tau[sl]
+            eng.col_den_batch = colden[sl]
+            eng.temp_batch = None if temp is None else temp[sl]
+            eng.los_axis = ss.axis[sl]
+            if outs[k] is None:
+                outs[k] = eng._grids(ss, modes, hcd_log_nhi)
+            outs[k][mode] = eng._mode_block(mode, cuts[k + 1] - cuts[k], ss.nbins,
+                                            with_temp, zero_below_cut)
+    return outs

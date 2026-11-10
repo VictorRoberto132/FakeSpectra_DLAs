@@ -253,6 +253,7 @@ def process_grid_chunk(args):
             filter_mode=filter_mode,
             dla_phys_thresh=dla_thresh,
             units=units,
+            **utils.SPECTRA_GAS_KWARGS,    # same star-forming gas model as the halo pipeline
         )
 
         # -------------------------------------------------------------------

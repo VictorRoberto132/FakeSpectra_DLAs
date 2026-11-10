@@ -33,3 +33,22 @@ notebooks_TNG/data_*/
 notebooks_TNG/voigt_temperature_fits/
 
 nohup.out
+
+# benchmarks: local build of the original fake_spectra and extraction outputs
+benchmarks/fake_spectra_upstream/
+benchmarks/results/
+benchmarks/*.log
+
+# logs, caches e produtos gerados
+*.log
+*.npz
+training/cache/
+test.png
+teste.png
+teste*.pdf
+training/sbi-logs/
+notebooks_TNG/temp_*.ipynb
+
+# arquivos locais
+CLAUDE.md
+data_TNG50-*/

@@ -1,0 +1,24 @@
+{
+  "config": {
+    "data_dir": "/home/vroberto/FakeSpectra_DLAs/data_TNG50-2_snap025_5runs",
+    "hubble_h": 0.6774,
+    "hcd_cut": 17.2,
+    "b_eps": 0.005,
+    "redshift": 3.008131071630377,
+    "length_unit_kpc": 1.0,
+    "test_fraction": 0.25,
+    "random_state": 42,
+    "n_train_haloes": 1587,
+    "n_test_haloes": 530
+  },
+  "metrics": {
+    "auc_test": 0.9711153974289151,
+    "brier_test": 0.06402950014799585,
+    "pinball_q50_lgbm": 0.24852595984294024,
+    "pinball_q50_baseline": 0.2536278163872832,
+    "coverage_68": 0.6271105711485097,
+    "coverage_90": 0.8536578631286844,
+    "floor_median_dex": 0.45807992835063044,
+    "model_halfwidth_median_dex": 0.5345345068218745
+  }
+}
